@@ -1,0 +1,16 @@
+DATE=2011-01-03
+SOURCE=HistData M1; M5 resampled from M1
+DESIGN=M5 model determines direction/context; M1 EMA3/8+RSI7+1m/3m momentum times entries and M1 OHLC executes exits
+CAUSALITY=M5 probability shifted +5m before forward-fill; signal on M1 close -> entry next M1 open
+RULES=M5 threshold .55; M1 confirmation; max 15 trades/day; 3-minute cooldown; max hold 20m; SL=max(.35*M5_ATR,3pips); TP=1.35R; leverage 5/10/15/25x; max 25x; RT spread 2pips
+TRADES=15
+INITIAL=10000.00
+FINAL=9650.37
+RETURN_PCT=-3.4963%
+WINS=2
+LOSSES=13
+WIN_RATE=13.33%
+GROSS_PROFIT=36.80
+GROSS_LOSS=386.42
+PF=0.0952
+MAX_DD=3.4963%
