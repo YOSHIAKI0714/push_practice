@@ -14,31 +14,53 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Download and backtest
+      - name: Install dependency
+        run: pip install beautifulsoup4 requests
+      - name: Download HistData and backtest
         run: |
           python - <<'PY'
-          import csv, urllib.request
+          import csv, io, zipfile, requests
+          from bs4 import BeautifulSoup
           from datetime import datetime
-          url='https://s3.eu-west-2.amazonaws.com/mlnd.andysrobots.com/fxdata/DAT_ASCII_USDJPY_M1_2011.csv'
-          src='/tmp/usdjpy_2011.csv'; urllib.request.urlretrieve(url,src)
+
+          pair='USDJPY'; year='2011'
+          referer=f'https://www.histdata.com/download-free-forex-historical-data/?/ascii/1-minute-bar-quotes/{pair.lower()}/{year}'
+          s=requests.Session()
+          r=s.get(referer,timeout=60)
+          r.raise_for_status()
+          soup=BeautifulSoup(r.content,'html.parser')
+          token=soup.find('input',{'id':'tk'})['value']
+          headers={'Referer':referer,'Origin':'https://www.histdata.com','User-Agent':'Mozilla/5.0'}
+          data={'tk':token,'date':year,'datemonth':year,'platform':'ASCII','timeframe':'M1','fxpair':pair}
+          rr=s.post('https://www.histdata.com/get.php',data=data,headers=headers,timeout=120)
+          rr.raise_for_status()
+          assert len(rr.content)>1000, f'download too small: {len(rr.content)}'
+          z=zipfile.ZipFile(io.BytesIO(rr.content))
+          names=z.namelist(); assert names, 'empty zip'
+          raw=z.read(names[0]).decode('utf-8','ignore').splitlines()
+
           rows=[]
-          with open(src) as f:
-              for line in f:
-                  if not line.startswith('20110103 '): continue
-                  p=line.strip().split(';')
-                  if len(p)>=5:
-                      rows.append((datetime.strptime(p[0],'%Y%m%d %H%M%S'),*map(float,p[1:5])))
-          assert rows, 'No rows found'
+          for line in raw:
+              if not line.startswith('20110103 '): continue
+              p=line.strip().split(';')
+              if len(p)>=5:
+                  rows.append((datetime.strptime(p[0],'%Y%m%d %H%M%S'),*map(float,p[1:5])))
+          assert rows, 'No 20110103 rows found'
+
           bars=[]
-          for k in range(0,len(rows),5):
-              g=rows[k:k+5]
-              if len(g)<5 or g[0][0].minute%5: continue
-              if any((g[j][0]-g[j-1][0]).total_seconds()!=60 for j in range(1,5)): continue
-              bars.append({'time':g[0][0],'open':g[0][1],'high':max(x[2] for x in g),'low':min(x[3] for x in g),'close':g[-1][4]})
+          bybucket={}
+          for r0 in rows:
+              t=r0[0]; bucket=t.replace(minute=(t.minute//5)*5,second=0)
+              bybucket.setdefault(bucket,[]).append(r0)
+          for t in sorted(bybucket):
+              g=sorted(bybucket[t])
+              if len(g)<1: continue
+              bars.append({'time':t,'open':g[0][1],'high':max(x[2] for x in g),'low':min(x[3] for x in g),'close':g[-1][4]})
+
           def ema(v,n):
-              a=2/(n+1); o=[]; e=None
+              a=2/(n+1);o=[];e=None
               for x in v:
-                  e=x if e is None else a*x+(1-a)*e; o.append(e)
+                  e=x if e is None else a*x+(1-a)*e;o.append(e)
               return o
           def rsi(v,n=14):
               o=[None]*len(v)
@@ -47,33 +69,38 @@ jobs:
               al=sum(max(v[i-1]-v[i],0) for i in range(1,n+1))/n
               o[n]=100 if al==0 else 100-100/(1+ag/al)
               for i in range(n+1,len(v)):
-                  d=v[i]-v[i-1]; ag=(ag*(n-1)+max(d,0))/n; al=(al*(n-1)+max(-d,0))/n
+                  d=v[i]-v[i-1];ag=(ag*(n-1)+max(d,0))/n;al=(al*(n-1)+max(-d,0))/n
                   o[i]=100 if al==0 else 100-100/(1+ag/al)
               return o
           def atr(bs,n=14):
               tr=[]
               for i,b in enumerate(bs):
-                  pc=bs[i-1]['close'] if i else b['close']; tr.append(max(b['high']-b['low'],abs(b['high']-pc),abs(b['low']-pc)))
+                  pc=bs[i-1]['close'] if i else b['close']
+                  tr.append(max(b['high']-b['low'],abs(b['high']-pc),abs(b['low']-pc)))
               o=[None]*len(bs)
               if len(tr)<n:return o
               a=sum(tr[:n])/n;o[n-1]=a
               for i in range(n,len(tr)):a=(a*(n-1)+tr[i])/n;o[i]=a
               return o
-          c=[b['close'] for b in bars];e9=ema(c,9);e21=ema(c,21);e12=ema(c,12);e26=ema(c,26);m=[x-y for x,y in zip(e12,e26)];ms=ema(m,9);rs=rsi(c);at=atr(bars)
+
+          c=[b['close'] for b in bars]
+          e9=ema(c,9);e21=ema(c,21);e12=ema(c,12);e26=ema(c,26);macd=[x-y for x,y in zip(e12,e26)];macds=ema(macd,9);rs=rsi(c);at=atr(bars)
           for i,b in enumerate(bars):
-              b.update(ema9=e9[i],ema21=e21[i],rsi=rs[i],macd=m[i],macdsig=ms[i],atr=at[i])
+              b.update(ema9=e9[i],ema21=e21[i],rsi=rs[i],macd=macd[i],macdsig=macds[i],atr=at[i])
               if i>=20:
                   p=bars[i-20:i];b['hh20']=max(x['high'] for x in p);b['ll20']=min(x['low'] for x in p)
               else:b['hh20']=b['ll20']=None
+
           def score(i):
               b=bars[i]
               if b['rsi'] is None or b['atr'] is None or b['hh20'] is None:return 0,0
               bull=[b['ema9']>b['ema21'],b['rsi']>55,b['macd']>b['macdsig'],b['macd']>bars[i-1]['macd'],b['close']>b['hh20']]
               bear=[b['ema9']<b['ema21'],b['rsi']<45,b['macd']<b['macdsig'],b['macd']<bars[i-1]['macd'],b['close']<b['ll20']]
-              a=sum(bull);s=sum(bear)
-              if a>=3 and a>s:return 1,a
-              if s>=3 and s>a:return -1,s
-              return 0,max(a,s)
+              a=sum(bull);s0=sum(bear)
+              if a>=3 and a>s0:return 1,a
+              if s0>=3 and s0>a:return -1,s0
+              return 0,max(a,s0)
+
           spread=.02;bal=10000.;trades=[];pos=None;pending=None
           for i,b in enumerate(bars):
               if pending and pos is None:
@@ -81,7 +108,8 @@ jobs:
                   pos={'dir':d,'score':sc,'lev':lev,'entry':entry,'stop':entry-d*a,'target':entry+d*1.5*a,'entry_time':b['time'],'signal_time':bars[si]['time'],'balance_before':bal};pending=None
               if pos:
                   d=pos['dir'];ep=None;reason=None
-                  hs=b['low']<=pos['stop'] if d==1 else b['high']>=pos['stop'];ht=b['high']>=pos['target'] if d==1 else b['low']<=pos['target']
+                  hs=b['low']<=pos['stop'] if d==1 else b['high']>=pos['stop']
+                  ht=b['high']>=pos['target'] if d==1 else b['low']<=pos['target']
                   if hs:ep=pos['stop']-(spread/2 if d==1 else -spread/2);reason='SL'
                   elif ht:ep=pos['target']-(spread/2 if d==1 else -spread/2);reason='TP'
                   elif i==len(bars)-1:ep=b['close']-(spread/2 if d==1 else -spread/2);reason='EOD'
@@ -90,21 +118,25 @@ jobs:
               if pos is None and pending is None and i<len(bars)-1:
                   d,sc=score(i)
                   if d:pending=(d,sc,i)
+
           with open('usdjpy_20110103_trades.csv','w',newline='') as f:
               fields=['signal_time','entry_time','exit_time','dir','score','lev','entry','stop','target','exit','reason','ret_unlev','pnl','balance_before','balance_after'];w=csv.DictWriter(f,fieldnames=fields);w.writeheader();[w.writerow({k:t[k] for k in fields}) for t in trades]
+          with open('usdjpy_20110103_5m.csv','w',newline='') as f:
+              w=csv.writer(f);w.writerow(['time','open','high','low','close'])
+              for b in bars:w.writerow([b['time'],b['open'],b['high'],b['low'],b['close']])
           wins=sum(t['pnl']>0 for t in trades);gp=sum(max(t['pnl'],0) for t in trades);gl=-sum(min(t['pnl'],0) for t in trades);peak=10000.;dd=0
           for t in trades:peak=max(peak,t['balance_after']);dd=max(dd,(peak-t['balance_after'])/peak)
           with open('usdjpy_20110103_summary.txt','w') as f:
-              f.write(f'source={url}\nsource_timezone=EST fixed, no DST\nm1_rows={len(rows)}\n5m_bars={len(bars)}\n')
+              f.write(f'source=HistData official\nsource_page={referer}\nsource_timezone=EST fixed, no DST\nzip_member={names[0]}\nm1_rows={len(rows)}\n5m_bars={len(bars)}\n')
               f.write(f'first={rows[0]}\nlast={rows[-1]}\nday_ohlc={rows[0][1]},{max(x[2] for x in rows)},{min(x[3] for x in rows)},{rows[-1][4]}\n')
               f.write(f'trades={len(trades)}\nwins={wins}\nlosses={len(trades)-wins}\nwin_rate={(100*wins/len(trades) if trades else 0):.2f}%\ninitial_balance=10000.00\nfinal_balance={bal:.2f}\nreturn_pct={(bal/10000-1)*100:.4f}%\ngross_profit={gp:.2f}\ngross_loss={gl:.2f}\nprofit_factor={(gp/gl if gl else float("inf"))}\nmax_drawdown_pct={dd*100:.4f}%\n')
-              f.write('rules=5m; EMA9/21, RSI14, MACD, MACD momentum, 20-bar breakout; score>=3; leverage 5/15/25x; SL 1ATR; TP 1.5ATR; spread 0.02 JPY round-trip modeled; same-bar SL first\n')
+              f.write('rules=5m; EMA9/21, RSI14, MACD, MACD momentum, 20-bar breakout; score>=3; leverage 5/15/25x; SL 1ATR; TP 1.5ATR; modeled spread 0.02 JPY round-trip; same-bar SL first\n')
           print(open('usdjpy_20110103_summary.txt').read())
           PY
       - name: Commit results
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add usdjpy_20110103_trades.csv usdjpy_20110103_summary.txt
+          git add usdjpy_20110103_trades.csv usdjpy_20110103_5m.csv usdjpy_20110103_summary.txt
           git commit -m "Add USDJPY 2011-01-03 backtest results" || exit 0
           git push
