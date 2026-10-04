@@ -1,0 +1,27 @@
+SOURCE=HistData official annual ASCII M1; resampled to 5m
+SOURCE_TIMEZONE=EST fixed, no DST
+MODEL=StandardScaler + balanced LogisticRegression(C=0.5), trained only on pre-2011 5m data; 30m direction target
+RULES=threshold 0.64; stop 1.2 ATR; target 2.16 ATR; next-bar entry; max 6 trades/day; 3-bar cooldown; max hold 6 bars; leverage 5/15/25x; max 25x; round-trip spread 0.02 JPY; same-bar SL before TP
+TRADES=50
+FIRST_SIGNAL=2011-01-03 23:00:00
+FIRST_ENTRY=2011-01-03 23:05:00
+LAST_EXIT=2011-05-26 00:55:00
+INITIAL_BALANCE=10000.00
+FINAL_BALANCE=8833.01
+RETURN_PCT=-11.6699%
+WINS=21
+LOSSES=29
+WIN_RATE=42.00%
+GROSS_PROFIT=2144.75
+GROSS_LOSS=3311.74
+PROFIT_FACTOR=0.6476
+MAX_DRAWDOWN_PCT=19.5902%
+AVG_WIN=102.13
+AVG_LOSS=-114.20
+MAX_WIN=533.65
+MAX_LOSS=-987.29
+MAX_WIN_STREAK=10
+MAX_LOSS_STREAK=13
+LEVERAGE_COUNTS={5: 36, 15: 9, 25: 5}
+SIDE_COUNTS={'LONG': 19, 'SHORT': 31}
+EXIT_REASONS={'SL': 27, 'TP': 19, 'TIME': 4}
