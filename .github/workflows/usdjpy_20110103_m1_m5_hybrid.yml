@@ -1,0 +1,131 @@
+name: USDJPY 2011-01-03 M1+M5 hybrid
+
+on:
+  push:
+    paths: ['.github/workflows/usdjpy_20110103_m1_m5_hybrid.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install -q pandas numpy scikit-learn requests beautifulsoup4
+      - name: Train pre-2011 M5 model and execute with M1 timing
+        run: |
+          python - <<'PY'
+          import io, zipfile, time, requests, numpy as np, pandas as pd
+          from bs4 import BeautifulSoup
+          from sklearn.preprocessing import StandardScaler
+          from sklearn.linear_model import LogisticRegression
+
+          BASE='https://www.histdata.com/download-free-forex-historical-data/?/ascii/1-minute-bar-quotes/'
+          def get_year(y):
+              ref=f'{BASE}usdjpy/{y}'
+              s=requests.Session(); r=s.get(ref,timeout=30); r.raise_for_status()
+              soup=BeautifulSoup(r.content,'html.parser'); token=soup.find('input',{'id':'tk'}).attrs['value']
+              form={'tk':token,'date':str(y),'datemonth':str(y),'platform':'ASCII','timeframe':'M1','fxpair':'USDJPY'}
+              z=s.post('https://www.histdata.com/get.php',data=form,headers={'Referer':ref,'Origin':'https://www.histdata.com','User-Agent':'Mozilla/5.0'},timeout=90); z.raise_for_status()
+              with zipfile.ZipFile(io.BytesIO(z.content)) as q:
+                  raw=q.read([n for n in q.namelist() if n.lower().endswith('.csv')][0])
+              x=pd.read_csv(io.BytesIO(raw),sep=';',header=None,usecols=[0,1,2,3,4],names=['dt','open','high','low','close'])
+              x['dt']=pd.to_datetime(x.dt.astype(str),format='%Y%m%d %H%M%S')
+              return x.set_index('dt').sort_index()
+
+          # Build pre-2011 M5 training set year by year. Keep 2011 M1 intact for execution.
+          m5_frames=[]; m1_2011=None
+          for y in range(2000,2012):
+              print('DOWNLOAD',y,flush=True); m1=get_year(y); print(y,len(m1),flush=True)
+              if y==2011: m1_2011=m1.copy()
+              q=m1.resample('5min',label='left',closed='left').agg({'open':'first','high':'max','low':'min','close':'last'}).dropna()
+              m5_frames.append(q); time.sleep(.2)
+          b=pd.concat(m5_frames).sort_index(); b=b[~b.index.duplicated(keep='last')]; c=b.close
+
+          e5=c.ewm(span=5,adjust=False).mean(); e9=c.ewm(span=9,adjust=False).mean(); e21=c.ewm(span=21,adjust=False).mean()
+          e12=c.ewm(span=12,adjust=False).mean(); e26=c.ewm(span=26,adjust=False).mean(); macd=e12-e26; ms=macd.ewm(span=9,adjust=False).mean()
+          d=c.diff(); g=d.clip(lower=0).ewm(alpha=1/14,adjust=False,min_periods=14).mean(); l=(-d.clip(upper=0)).ewm(alpha=1/14,adjust=False,min_periods=14).mean(); rsi=(100-100/(1+g/l.replace(0,np.nan))).fillna(50)
+          pc=c.shift(); tr=pd.concat([b.high-b.low,(b.high-pc).abs(),(b.low-pc).abs()],axis=1).max(axis=1); atr5=tr.ewm(alpha=1/14,adjust=False,min_periods=14).mean()
+          hi12=b.high.shift().rolling(12).max(); lo12=b.low.shift().rolling(12).min(); rg=(hi12-lo12).replace(0,np.nan)
+          X=pd.DataFrame(index=b.index)
+          X['ema5_9']=(e5-e9)/atr5; X['ema9_21']=(e9-e21)/atr5; X['rsi']=(rsi-50)/50; X['macdh']=(macd-ms)/atr5
+          X['mom5']=(c/c.shift(1)-1)/(atr5/c); X['mom10']=(c/c.shift(2)-1)/(atr5/c); X['mom15']=(c/c.shift(3)-1)/(atr5/c); X['mom30']=(c/c.shift(6)-1)/(atr5/c)
+          X['range12']=(c-lo12)/rg*2-1; X['atrpct']=atr5/c; X['hsin']=np.sin(2*np.pi*b.index.hour/24); X['hcos']=np.cos(2*np.pi*b.index.hour/24)
+          fc=list(X.columns)
+          fwd=c.shift(-2)-c; gap=pd.Series(b.index,index=b.index).shift(-2)-pd.Series(b.index,index=b.index); valid=gap<=pd.Timedelta(minutes=15)
+          y=pd.Series(np.nan,index=b.index); y[(fwd>.01)&valid]=1; y[(fwd<-.01)&valid]=0
+          ds=X.join(b[['open','high','low','close']]); ds['atr5']=atr5; ds['y']=y; ds=ds.replace([np.inf,-np.inf],np.nan)
+          pre=ds[(ds.index<'2011-01-01')&ds.y.notna()].dropna(subset=fc).iloc[::2]
+          sc=StandardScaler().fit(pre[fc]); model=LogisticRegression(C=.5,max_iter=400,class_weight='balanced',random_state=7).fit(sc.transform(pre[fc]),pre.y.astype(int))
+
+          # M5 probability/context for 2011-01-03, then forward-fill only AFTER each completed M5 bar.
+          day5=ds.loc['2011-01-03'].copy(); ok=day5[fc].notna().all(axis=1); day5['p5']=np.nan; day5.loc[ok,'p5']=model.predict_proba(sc.transform(day5.loc[ok,fc]))[:,1]
+          # Shift by 5 minutes so M1 bar at t only sees M5 bar that ended at t.
+          ctx=pd.DataFrame(index=day5.index+pd.Timedelta(minutes=5))
+          ctx['p5']=day5['p5'].values; ctx['atr5']=day5['atr5'].values; ctx['m5close']=day5['close'].values
+
+          m1=m1_2011.loc['2011-01-03'].copy()
+          # M1 micro indicators, calculated causally using full 2011 history up through each minute.
+          full=m1_2011.copy(); cc=full.close
+          em3=cc.ewm(span=3,adjust=False).mean(); em8=cc.ewm(span=8,adjust=False).mean()
+          dd=cc.diff(); gg=dd.clip(lower=0).ewm(alpha=1/7,adjust=False,min_periods=7).mean(); ll=(-dd.clip(upper=0)).ewm(alpha=1/7,adjust=False,min_periods=7).mean(); rsi1=(100-100/(1+gg/ll.replace(0,np.nan))).fillna(50)
+          pc1=cc.shift(); tr1=pd.concat([full.high-full.low,(full.high-pc1).abs(),(full.low-pc1).abs()],axis=1).max(axis=1); atr1=tr1.ewm(alpha=1/10,adjust=False,min_periods=10).mean()
+          micro=pd.DataFrame(index=full.index); micro['ema3']=em3; micro['ema8']=em8; micro['rsi7']=rsi1; micro['atr1']=atr1; micro['mom1']=cc.diff(1); micro['mom3']=cc.diff(3)
+          m1=m1.join(micro.loc['2011-01-03'])
+          m1=m1.join(ctx.reindex(m1.index,method='ffill'))
+
+          # Hybrid intraday rules: M5 decides direction; M1 decides entry timing.
+          # Aim for repeated but not frantic trading: max 15/day, 3-min cooldown, max 20-min hold.
+          TH5=.55; SPR=.02; MAX_TRADES=15; COOLDOWN=3; MAX_HOLD=20
+          bal=10000.; peak=10000.; maxdd=0.; pos=None; pending=None; cool=0; trades=[]; R=list(m1.itertuples())
+          for i,r in enumerate(R):
+              if cool>0: cool-=1
+              if pending and pos is None and len(trades)<MAX_TRADES:
+                  di,cf,si=pending; sr=R[si]
+                  lev=5 if cf<.58 else (10 if cf<.61 else (15 if cf<.65 else 25))
+                  if np.isfinite(sr.atr5) and sr.atr5>0:
+                      en=r.open+(SPR/2 if di==1 else -SPR/2)
+                      # Use M5 ATR for robust stop distance; execute on M1.
+                      sl_dist=max(0.35*sr.atr5,0.03)
+                      tp_dist=1.35*sl_dist
+                      pos={'d':di,'cf':cf,'lev':lev,'en':en,'sl':en-di*sl_dist,'tp':en+di*tp_dist,'ei':i,'et':r.Index,'st':sr.Index,'bb':bal}
+                  pending=None
+              if pos:
+                  di=pos['d']; ep=None; reason=None
+                  hs=(r.low<=pos['sl']) if di==1 else (r.high>=pos['sl']); ht=(r.high>=pos['tp']) if di==1 else (r.low<=pos['tp'])
+                  if hs: ep=pos['sl']-(SPR/2 if di==1 else -SPR/2); reason='SL'
+                  elif ht: ep=pos['tp']-(SPR/2 if di==1 else -SPR/2); reason='TP'
+                  elif i-pos['ei']>=MAX_HOLD: ep=r.close-(SPR/2 if di==1 else -SPR/2); reason='TIME'
+                  elif i==len(R)-1: ep=r.close-(SPR/2 if di==1 else -SPR/2); reason='EOD'
+                  if ep is not None:
+                      ret=di*(ep-pos['en'])/pos['en']; pnl=bal*pos['lev']*ret; bal+=pnl
+                      trades.append({**pos,'xt':r.Index,'xp':ep,'reason':reason,'pnl':pnl,'ba':bal}); peak=max(peak,bal); maxdd=max(maxdd,(peak-bal)/peak); pos=None; cool=COOLDOWN
+              if pos is None and pending is None and cool==0 and len(trades)<MAX_TRADES and i<len(R)-1 and np.isfinite(r.p5):
+                  # M1 confirmation must agree with M5 direction.
+                  bull=(r.p5>=TH5 and r.ema3>r.ema8 and r.rsi7>=52 and r.mom1>0 and r.mom3>0)
+                  bear=(r.p5<=1-TH5 and r.ema3<r.ema8 and r.rsi7<=48 and r.mom1<0 and r.mom3<0)
+                  if bull: pending=(1,r.p5,i)
+                  elif bear: pending=(-1,1-r.p5,i)
+
+          rows=[]
+          for n,t in enumerate(trades,1): rows.append({'trade_no':n,'signal_time':t['st'],'entry_time':t['et'],'exit_time':t['xt'],'side':'LONG' if t['d']==1 else 'SHORT','confidence5m':t['cf'],'leverage':t['lev'],'entry':t['en'],'stop':t['sl'],'target':t['tp'],'exit':t['xp'],'reason':t['reason'],'pnl_yen':t['pnl'],'balance_before':t['bb'],'balance_after':t['ba']})
+          pd.DataFrame(rows).to_csv('usdjpy_20110103_m1_m5_hybrid_trades.csv',index=False)
+          wins=[t for t in trades if t['pnl']>0]; losses=[t for t in trades if t['pnl']<0]; gp=sum(t['pnl'] for t in wins); gl=-sum(t['pnl'] for t in losses)
+          with open('usdjpy_20110103_m1_m5_hybrid_summary.txt','w') as f:
+              f.write('DATE=2011-01-03\nSOURCE=HistData M1; M5 resampled from M1\n')
+              f.write('DESIGN=M5 model determines direction/context; M1 EMA3/8+RSI7+1m/3m momentum times entries and M1 OHLC executes exits\n')
+              f.write('CAUSALITY=M5 probability shifted +5m before forward-fill; signal on M1 close -> entry next M1 open\n')
+              f.write('RULES=M5 threshold .55; M1 confirmation; max 15 trades/day; 3-minute cooldown; max hold 20m; SL=max(.35*M5_ATR,3pips); TP=1.35R; leverage 5/10/15/25x; max 25x; RT spread 2pips\n')
+              f.write(f'TRADES={len(trades)}\nINITIAL=10000.00\nFINAL={bal:.2f}\nRETURN_PCT={(bal/10000-1)*100:.4f}%\nWINS={len(wins)}\nLOSSES={len(losses)}\nWIN_RATE={(100*len(wins)/len(trades) if trades else 0):.2f}%\nGROSS_PROFIT={gp:.2f}\nGROSS_LOSS={gl:.2f}\nPF={(gp/gl if gl else float("inf")):.4f}\nMAX_DD={maxdd*100:.4f}%\n')
+          print(open('usdjpy_20110103_m1_m5_hybrid_summary.txt').read())
+          PY
+      - name: Commit results
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add usdjpy_20110103_m1_m5_hybrid_summary.txt usdjpy_20110103_m1_m5_hybrid_trades.csv
+          git commit -m 'Add USDJPY M1 M5 hybrid intraday results' || exit 0
+          git push
