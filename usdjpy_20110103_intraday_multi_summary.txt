@@ -1,0 +1,15 @@
+DATE=2011-01-03
+SOURCE=HistData M1 -> 5m
+MODEL=pre-2011 logistic regression, 10-minute direction target
+RULES=threshold .54; no daily trade cap; one-position-at-a-time; 1-bar cooldown; max hold 15m; SL .8ATR; TP .96ATR; leverage 5/10/15/25x; max 25x; round-trip spread .02 JPY; signal close -> next bar open
+TRADES=60
+INITIAL=10000.00
+FINAL=8761.01
+RETURN_PCT=-12.3899%
+WINS=10
+LOSSES=49
+WIN_RATE=16.67%
+GROSS_PROFIT=115.54
+GROSS_LOSS=1354.53
+PF=0.0853
+MAX_DD=12.3899%
