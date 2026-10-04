@@ -1,0 +1,11 @@
+TOTAL_5M_BARS=818269
+FIT_2000_2007=123421
+FINAL_PRE2011=179567
+BEST_THRESHOLD=0.64
+BEST_STOP_ATR=1.2
+BEST_RR=1.8
+VAL_2008=return -11.1042%, dd 27.6236%, pf 0.9056, trades 203
+VAL_2009=return -45.5312%, dd 52.5135%, pf 0.5963, trades 259
+VAL_2010=return -38.0233%, dd 39.2006%, pf 0.5976, trades 246
+TEST_2011_01_03=final 9970.27, return -0.2973%, trades 1, wins 0, winrate 0.00%, pf 0.0000, maxdd 0.2973%
+RULES=5m causal features; 30m direction model; next-bar entry; max 6 trades/day; cooldown 3 bars; max hold 6 bars; leverage 5/15/25x; max 25x; spread 0.02 JPY round-trip; SL before TP on same bar
