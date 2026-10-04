@@ -1,0 +1,259 @@
+name: USDJPY pre-2011 ML walk-forward
+
+on:
+  push:
+    paths:
+      - '.github/workflows/usdjpy_pre2011_ml.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  train-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: pip install -q pandas numpy scikit-learn requests beautifulsoup4
+      - name: Download 2000-2011 data, train on pre-2011, test 2011-01-03
+        run: |
+          python - <<'PY'
+          import io, os, zipfile, math, time
+          import requests
+          import numpy as np
+          import pandas as pd
+          from bs4 import BeautifulSoup
+          from sklearn.preprocessing import StandardScaler
+          from sklearn.linear_model import LogisticRegression
+          
+          PAIR='USDJPY'
+          BASE='https://www.histdata.com/download-free-forex-historical-data/?/ascii/1-minute-bar-quotes/'
+          
+          def download_year(year):
+              referer=f'{BASE}{PAIR.lower()}/{year}'
+              s=requests.Session()
+              r=s.get(referer,timeout=30)
+              r.raise_for_status()
+              soup=BeautifulSoup(r.content,'html.parser')
+              inp=soup.find('input',{'id':'tk'})
+              if inp is None:
+                  raise RuntimeError(f'no token for {year}')
+              token=inp.attrs['value']
+              data={'tk':token,'date':str(year),'datemonth':str(year),'platform':'ASCII','timeframe':'M1','fxpair':PAIR}
+              headers={'Referer':referer,'Origin':'https://www.histdata.com','User-Agent':'Mozilla/5.0'}
+              z=s.post('https://www.histdata.com/get.php',data=data,headers=headers,timeout=90)
+              z.raise_for_status()
+              if len(z.content)<1000:
+                  raise RuntimeError(f'small download {year}: {len(z.content)} bytes')
+              return z.content
+          
+          def year_to_5m(year, content):
+              with zipfile.ZipFile(io.BytesIO(content)) as zf:
+                  names=[n for n in zf.namelist() if n.lower().endswith('.csv')]
+                  if not names: raise RuntimeError(f'no csv in {year}')
+                  raw=zf.read(names[0])
+              df=pd.read_csv(io.BytesIO(raw),sep=';',header=None,usecols=[0,1,2,3,4],
+                             names=['dt','open','high','low','close'])
+              df['dt']=pd.to_datetime(df['dt'].astype(str),format='%Y%m%d %H%M%S',errors='coerce')
+              df=df.dropna(subset=['dt']).set_index('dt').sort_index()
+              out=df.resample('5min',label='left',closed='left').agg({'open':'first','high':'max','low':'min','close':'last'}).dropna()
+              out['year']=year
+              return out
+          
+          frames=[]; downloaded=[]; failed=[]
+          for year in range(2000,2012):
+              try:
+                  print('DOWNLOAD',year,flush=True)
+                  content=download_year(year)
+                  bars=year_to_5m(year,content)
+                  print(year,'5m bars',len(bars),flush=True)
+                  frames.append(bars); downloaded.append(year)
+              except Exception as e:
+                  print('FAILED',year,repr(e),flush=True); failed.append((year,repr(e)))
+              time.sleep(0.4)
+          if 2010 not in downloaded or 2011 not in downloaded:
+              raise RuntimeError(f'missing critical years; downloaded={downloaded}')
+          allb=pd.concat(frames).sort_index()
+          allb=allb[~allb.index.duplicated(keep='last')]
+          
+          # Causal features only: every value at bar i uses bar i or earlier.
+          c=allb['close']
+          ema9=c.ewm(span=9,adjust=False).mean(); ema21=c.ewm(span=21,adjust=False).mean()
+          ema12=c.ewm(span=12,adjust=False).mean(); ema26=c.ewm(span=26,adjust=False).mean()
+          macd=ema12-ema26; macdsig=macd.ewm(span=9,adjust=False).mean(); macdh=macd-macdsig
+          delta=c.diff(); gain=delta.clip(lower=0); loss=(-delta.clip(upper=0))
+          ag=gain.ewm(alpha=1/14,adjust=False,min_periods=14).mean(); al=loss.ewm(alpha=1/14,adjust=False,min_periods=14).mean()
+          rsi=100-100/(1+ag/al.replace(0,np.nan)); rsi=rsi.fillna(100)
+          pc=c.shift(1)
+          tr=pd.concat([(allb.high-allb.low),(allb.high-pc).abs(),(allb.low-pc).abs()],axis=1).max(axis=1)
+          atr=tr.ewm(alpha=1/14,adjust=False,min_periods=14).mean()
+          hi20=allb.high.shift(1).rolling(20).max(); lo20=allb.low.shift(1).rolling(20).min()
+          rng20=(hi20-lo20).replace(0,np.nan)
+          feat=pd.DataFrame(index=allb.index)
+          feat['ema_gap']=(ema9-ema21)/atr
+          feat['rsi']=(rsi-50)/50
+          feat['macdh']=macdh/atr
+          feat['mom15']=(c/c.shift(3)-1)/(atr/c)
+          feat['mom60']=(c/c.shift(12)-1)/(atr/c)
+          feat['mom180']=(c/c.shift(36)-1)/(atr/c)
+          feat['range_pos20']=(c-lo20)/rng20*2-1
+          feat['atr_pct']=atr/c
+          feat['day_mom']=c/c.shift(288)-1
+          feat['hour_sin']=np.sin(2*np.pi*allb.index.hour/24)
+          feat['hour_cos']=np.cos(2*np.pi*allb.index.hour/24)
+          feature_cols=list(feat.columns)
+          
+          # 30-minute forward direction for training. Exclude neutral moves within 2 pips and gaps.
+          fwd=c.shift(-6)-c
+          tdiff=pd.Series(allb.index,index=allb.index).shift(-6)-pd.Series(allb.index,index=allb.index)
+          valid_gap=tdiff<=pd.Timedelta(minutes=35)
+          y=pd.Series(np.nan,index=allb.index)
+          y[(fwd>0.02)&valid_gap]=1
+          y[(fwd<-0.02)&valid_gap]=0
+          
+          dataset=feat.copy(); dataset['atr']=atr; dataset['open_next']=allb.open.shift(-1); dataset['y']=y
+          dataset=dataset.replace([np.inf,-np.inf],np.nan)
+          
+          # Chronological split: fit 2000-2007, select trading hyperparameters on 2008-2010 only.
+          train_mask=(dataset.index<'2008-01-01') & dataset['y'].notna()
+          val_mask=(dataset.index>='2008-01-01') & (dataset.index<'2011-01-01') & dataset['y'].notna()
+          train=dataset.loc[train_mask].dropna(subset=feature_cols)
+          val=dataset.loc[val_mask].dropna(subset=feature_cols)
+          if len(train)<10000 or len(val)<10000:
+              raise RuntimeError(f'insufficient data train={len(train)} val={len(val)} downloaded={downloaded}')
+          # reduce serial dependence / runtime using every 3rd eligible training row
+          train_fit=train.iloc[::3]
+          scaler=StandardScaler().fit(train_fit[feature_cols])
+          model=LogisticRegression(C=0.5,max_iter=400,class_weight='balanced',random_state=7)
+          model.fit(scaler.transform(train_fit[feature_cols]),train_fit['y'].astype(int))
+          
+          val_all=dataset.loc[(dataset.index>='2008-01-01')&(dataset.index<'2011-01-01')].copy()
+          ok=val_all[feature_cols].notna().all(axis=1)
+          val_all['p_up']=np.nan
+          val_all.loc[ok,'p_up']=model.predict_proba(scaler.transform(val_all.loc[ok,feature_cols]))[:,1]
+          
+          def bt(df, threshold, stop_atr, rr, max_hold=6, max_trades_day=6, cooldown=3, initial=10000.0):
+              spread=0.02
+              bal=initial; peak=initial; maxdd=0.0; trades=[]; pos=None; pending=None
+              daycount={}; cool=0
+              rows=list(df.itertuples())
+              for i,r in enumerate(rows):
+                  if cool>0: cool-=1
+                  # enter pending at this bar open
+                  if pending and pos is None:
+                      d,conf,signal_i=pending; sr=rows[signal_i]
+                      date=str(r.Index.date())
+                      if daycount.get(date,0)<max_trades_day:
+                          if conf < threshold+0.04: lev=5
+                          elif conf < threshold+0.09: lev=15
+                          else: lev=25
+                          entry=r.open + (spread/2 if d==1 else -spread/2)
+                          a=sr.atr
+                          if np.isfinite(a) and a>0:
+                              pos={'dir':d,'lev':lev,'entry':entry,'stop':entry-d*stop_atr*a,'target':entry+d*stop_atr*rr*a,
+                                   'entry_i':i,'entry_time':r.Index,'signal_time':sr.Index,'balance_before':bal,'conf':conf}
+                              daycount[date]=daycount.get(date,0)+1
+                      pending=None
+                  if pos is not None:
+                      d=pos['dir']; exitp=None; reason=None
+                      hs=(r.low<=pos['stop']) if d==1 else (r.high>=pos['stop'])
+                      ht=(r.high>=pos['target']) if d==1 else (r.low<=pos['target'])
+                      if hs:
+                          exitp=pos['stop']-(spread/2 if d==1 else -spread/2); reason='SL'
+                      elif ht:
+                          exitp=pos['target']-(spread/2 if d==1 else -spread/2); reason='TP'
+                      elif i-pos['entry_i']>=max_hold:
+                          exitp=r.close-(spread/2 if d==1 else -spread/2); reason='TIME'
+                      elif i==len(rows)-1:
+                          exitp=r.close-(spread/2 if d==1 else -spread/2); reason='EOD'
+                      if exitp is not None:
+                          ret=d*(exitp-pos['entry'])/pos['entry']; pnl=bal*pos['lev']*ret; bal+=pnl
+                          trd={**pos,'exit_time':r.Index,'exit':exitp,'reason':reason,'pnl':pnl,'balance_after':bal,'ret':ret}
+                          trades.append(trd); peak=max(peak,bal); maxdd=max(maxdd,(peak-bal)/peak); pos=None; cool=cooldown
+                  if pos is None and pending is None and cool==0 and i<len(rows)-1:
+                      p=r.p_up
+                      if np.isfinite(p):
+                          if p>=threshold: pending=(1,p,i)
+                          elif p<=1-threshold: pending=(-1,1-p,i)
+              gp=sum(max(t['pnl'],0) for t in trades); gl=-sum(min(t['pnl'],0) for t in trades)
+              return {'final':bal,'return_pct':(bal/initial-1)*100,'trades':len(trades),'wins':sum(t['pnl']>0 for t in trades),
+                      'pf':gp/gl if gl>0 else np.inf,'maxdd_pct':maxdd*100,'gp':gp,'gl':gl,'trade_list':trades}
+          
+          candidates=[]
+          for th in [0.56,0.58,0.60,0.62,0.64]:
+              for st,rr in [(1.0,1.5),(1.2,1.8),(1.5,2.0)]:
+                  yearly=[]
+                  for yr in [2008,2009,2010]:
+                      d=val_all.loc[str(yr)]
+                      res=bt(d,th,st,rr,max_hold=6,max_trades_day=6,cooldown=3)
+                      yearly.append(res)
+                  medret=float(np.median([x['return_pct'] for x in yearly])); meddd=float(np.median([x['maxdd_pct'] for x in yearly]))
+                  minret=float(min(x['return_pct'] for x in yearly)); meanpf=float(np.mean([min(x['pf'],5) for x in yearly]))
+                  trades=sum(x['trades'] for x in yearly)
+                  score=medret + 0.25*minret - 0.40*meddd + 2.0*(meanpf-1)
+                  candidates.append({'threshold':th,'stop_atr':st,'rr':rr,'score':score,'median_return':medret,'min_return':minret,
+                                     'median_dd':meddd,'mean_pf':meanpf,'trades':trades,'yearly':yearly})
+          candidates.sort(key=lambda x:x['score'],reverse=True)
+          best=candidates[0]
+          
+          # Final refit on all 2000-2010 labelled data, still no 2011 labels used.
+          pre=dataset.loc[(dataset.index<'2011-01-01')&dataset['y'].notna()].dropna(subset=feature_cols)
+          pre_fit=pre.iloc[::3]
+          scaler2=StandardScaler().fit(pre_fit[feature_cols])
+          model2=LogisticRegression(C=0.5,max_iter=400,class_weight='balanced',random_state=7)
+          model2.fit(scaler2.transform(pre_fit[feature_cols]),pre_fit['y'].astype(int))
+          
+          # Test exactly 2011-01-03, features are computed on history through current bar only.
+          test=dataset.loc['2011-01-03'].copy()
+          ok=test[feature_cols].notna().all(axis=1)
+          test['p_up']=np.nan
+          test.loc[ok,'p_up']=model2.predict_proba(scaler2.transform(test.loc[ok,feature_cols]))[:,1]
+          test_res=bt(test,best['threshold'],best['stop_atr'],best['rr'],max_hold=6,max_trades_day=6,cooldown=3)
+          
+          # Save compact validation table.
+          out=[]
+          for cand in candidates:
+              row={k:cand[k] for k in ['threshold','stop_atr','rr','score','median_return','min_return','median_dd','mean_pf','trades']}
+              for yr,res in zip([2008,2009,2010],cand['yearly']):
+                  row[f'ret_{yr}']=res['return_pct']; row[f'dd_{yr}']=res['maxdd_pct']; row[f'pf_{yr}']=res['pf']; row[f'n_{yr}']=res['trades']
+              out.append(row)
+          pd.DataFrame(out).to_csv('usdjpy_pre2011_validation.csv',index=False)
+          
+          trades=[]
+          for t in test_res['trade_list']:
+              trades.append({'signal_time':t['signal_time'],'entry_time':t['entry_time'],'exit_time':t['exit_time'],
+                             'side':'LONG' if t['dir']==1 else 'SHORT','confidence':t['conf'],'leverage':t['lev'],
+                             'entry':t['entry'],'stop':t['stop'],'target':t['target'],'exit':t['exit'],'reason':t['reason'],
+                             'pnl_yen':t['pnl'],'balance_before':t['balance_before'],'balance_after':t['balance_after']})
+          pd.DataFrame(trades).to_csv('usdjpy_20110103_ml_trades.csv',index=False)
+          
+          # Coefficients for transparency.
+          coef=pd.DataFrame({'feature':feature_cols,'coefficient':model2.coef_[0]})
+          coef.to_csv('usdjpy_pre2011_ml_coefficients.csv',index=False)
+          
+          with open('usdjpy_pre2011_ml_summary.txt','w') as f:
+              f.write('DATA_SOURCE=HistData official annual ASCII M1\n')
+              f.write('TIMEZONE=EST fixed, no DST (HistData specification)\n')
+              f.write(f'DOWNLOADED_YEARS={downloaded}\nFAILED_YEARS={failed}\n')
+              f.write(f'TOTAL_5M_BARS={len(allb)}\nTRAIN_ROWS_2000_2007={len(train)}\nVALIDATION_ROWS_2008_2010={len(val)}\nFINAL_PRE2011_ROWS={len(pre)}\n')
+              f.write('MODEL=StandardScaler + balanced LogisticRegression(C=0.5), 30-minute direction label excluding moves <=2 pips\n')
+              f.write('FEATURES='+','.join(feature_cols)+'\n')
+              f.write('HYPERPARAM_SELECTION=2008-2010 only; 2000-2007 model fit; score=median return +0.25*worst return -0.40*median DD +2*(mean PF-1)\n')
+              f.write(f"BEST_THRESHOLD={best['threshold']}\nBEST_STOP_ATR={best['stop_atr']}\nBEST_RR={best['rr']}\n")
+              f.write(f"VALIDATION_SCORE={best['score']:.4f}\nVALIDATION_MEDIAN_RETURN={best['median_return']:.4f}%\nVALIDATION_WORST_RETURN={best['min_return']:.4f}%\nVALIDATION_MEDIAN_DD={best['median_dd']:.4f}%\nVALIDATION_MEAN_PF={best['mean_pf']:.4f}\nVALIDATION_TRADES={best['trades']}\n")
+              for yr,res in zip([2008,2009,2010],best['yearly']):
+                  f.write(f"VAL_{yr}=return {res['return_pct']:.4f}%, dd {res['maxdd_pct']:.4f}%, pf {res['pf']:.4f}, trades {res['trades']}\n")
+              f.write('TEST_DATE=2011-01-03\nINITIAL_BALANCE=10000.00\n')
+              f.write(f"TEST_FINAL_BALANCE={test_res['final']:.2f}\nTEST_RETURN={test_res['return_pct']:.4f}%\nTEST_TRADES={test_res['trades']}\nTEST_WINS={test_res['wins']}\nTEST_WIN_RATE={(100*test_res['wins']/test_res['trades'] if test_res['trades'] else 0):.2f}%\nTEST_PF={test_res['pf']:.4f}\nTEST_MAX_DD={test_res['maxdd_pct']:.4f}%\n")
+              f.write('EXECUTION=signal at 5m close, entry next 5m open; max 6 trades/day; 3-bar cooldown; max hold 6 bars; leverage 5/15/25x by confidence; max leverage 25x; modeled round-trip spread 0.02 JPY; same-bar SL assumed before TP\n')
+          print(open('usdjpy_pre2011_ml_summary.txt').read())
+          PY
+      - name: Commit compact results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add usdjpy_pre2011_ml_summary.txt usdjpy_pre2011_validation.csv usdjpy_20110103_ml_trades.csv usdjpy_pre2011_ml_coefficients.csv
+          git commit -m "Add pre-2011 USDJPY ML walk-forward results" || exit 0
+          git push
